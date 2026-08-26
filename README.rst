@@ -58,6 +58,23 @@ If you have configured your private rsa key with a password you can provide it i
 Click on Save.
 Enjoy!
 
+Wallet integration
+------------------
+
+The event ticket is generated on demand from current pretix data and signed with the configured Pass Type ID
+certificate. Its QR barcode is exactly the ``OrderPosition.secret`` used by pretix check-in. Event series use the
+selected subevent for the event name, time, venue, website, and artwork fallback.
+
+Each ticket has a stable serial number derived from its immutable order-position ID. Tickets from the same order and
+event occurrence share a stable ``groupingIdentifier``. An order download is Apple's documented multi-pass format: a
+ZIP containing the individual ``.pkpass`` files, named with the ``.pkpasses`` extension and its standard MIME type.
+No APNs or PassKit web service is used yet, so every new download contains the current ticket data.
+
+The existing ``passbook_*`` certificate and key setting names remain compatible. The private key is used only by the
+server while signing and must not be committed to a repository. Canceled, blocked, and expired tickets are marked as
+voided during generation and are refused by the public download endpoint; an ``expirationDate`` is also included
+where a ticket or event end supplies one.
+
 License
 -------
 

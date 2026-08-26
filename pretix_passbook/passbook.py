@@ -1,5 +1,7 @@
 import re
+from io import BytesIO
 from typing import Tuple
+from zipfile import ZipFile
 
 import tempfile
 from collections import OrderedDict
@@ -10,22 +12,107 @@ from django.core.files.storage import default_storage
 from django.core.validators import RegexValidator
 from django.utils.formats import date_format
 from django.utils.translation import gettext, gettext_lazy as _  # NOQA
-from pretix.base.models import OrderPosition, ItemMetaValue
+from pretix.base.models import ItemMetaValue, Order, OrderPosition
 from pretix.base.pdf import get_seat
 from pretix.base.ticketoutput import BaseTicketOutput
+from pretix.base.timemachine import time_machine_now
 from pretix.control.forms import ClearableBasenameFileInput
-from pretix.multidomain.urlreverse import build_absolute_uri
+from pretix.multidomain.urlreverse import eventreverse_absolute
 from wallet.models import Barcode, BarcodeFormat, EventTicket, Location, Pass
 
 from pretix_passbook.forms import PNGImageField
 
 
+class PretixPass(Pass):
+    def __init__(self, *args, grouping_identifier, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.groupingIdentifier = grouping_identifier
+
+    def json_dict(self):
+        payload = super().json_dict()
+        payload["groupingIdentifier"] = self.groupingIdentifier
+        if payload.get("barcode"):
+            payload["barcodes"] = [payload.pop("barcode")]
+        return payload
+
+
+def serial_number(order_position: OrderPosition) -> str:
+    return f"pretix-{order_position.pk}"
+
+
+def grouping_identifier(order_position: OrderPosition) -> str:
+    event = order_position.order.event
+    return "pretix-{}-{}-{}-{}".format(
+        event.organizer_id,
+        event.pk,
+        order_position.subevent_id or 0,
+        order_position.order.pk,
+    )
+
+
+def _setting_file(event, key):
+    return event.settings.get(key, as_type=File, binary_file=True)
+
+
+def _add_image(passfile, name, image_file):
+    if not image_file:
+        return
+    if str(getattr(image_file, "name", "")).lower().endswith(".png"):
+        passfile.addFile(name, image_file)
+        return
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    image_file.seek(0)
+    with Image.open(image_file) as image:
+        converted = BytesIO()
+        image.save(converted, format="PNG")
+        converted.seek(0)
+        passfile.addFile(name, converted)
+
+
+def _first_setting_file(event, keys):
+    for key in keys:
+        image_file = _setting_file(event, key)
+        if image_file:
+            return image_file
+
+
 class PassbookOutput(BaseTicketOutput):
     identifier = "passbook"
-    verbose_name = "Passbook Tickets"
-    download_button_icon = "fa-mobile"
-    download_button_text = _("Wallet/Passbook")
-    multi_download_enabled = False
+    verbose_name = _("Apple Wallet event tickets")
+    download_button_icon = "fa-apple"
+    download_button_text = _("Add to Apple Wallet")
+    multi_download_button_text = _("Add all to Apple Wallet")
+    long_download_button_text = _("Add to Apple Wallet")
+    multi_download_enabled = True
+
+    def generate(self, order_position: OrderPosition) -> Tuple[str, str, str]:
+        return (
+            "passbook.url",
+            "text/uri-list",
+            eventreverse_absolute(
+                self.event,
+                "plugins:pretix_passbook:save",
+                kwargs={
+                    "order": order_position.order.code,
+                    "secret": order_position.order.secret,
+                    "position": order_position.pk,
+                },
+            ),
+        )
+
+    def generate_order(self, order: Order) -> Tuple[str, str, str]:
+        return (
+            "passbook-all.url",
+            "text/uri-list",
+            eventreverse_absolute(
+                self.event,
+                "plugins:pretix_passbook:save_all",
+                kwargs={"order": order.code, "secret": order.secret},
+            ),
+        )
 
     @property
     def settings_form_fields(self) -> dict:
@@ -284,7 +371,10 @@ class PassbookOutput(BaseTicketOutput):
         #  3. If there is a custom logo and we're not in an event series and do not custom admission time, we show
         #    [ CUSTOM LOGO ]
 
-        logo_file = self.event.settings.get("ticketoutput_passbook_logo")
+        logo_keys = ["ticketoutput_passbook_logo", "logo_image"]
+        if self.event.settings.get("organizer_logo_image_inherit"):
+            logo_keys.append("organizer_logo_image")
+        logo_file = _first_setting_file(self.event, logo_keys)
         if logo_file:
             logo_text = None
 
@@ -416,20 +506,46 @@ class PassbookOutput(BaseTicketOutput):
             gettext("Purchase date"),
         )
 
+        card.addBackField(
+            "ticketURL",
+            eventreverse_absolute(
+                order.event,
+                "presale:event.order.position",
+                kwargs={
+                    "order": order.code,
+                    "position": order_position.positionid,
+                    "secret": order_position.web_secret,
+                },
+            ),
+            gettext("Ticket"),
+        )
+        card.addBackField(
+            "orderURL",
+            eventreverse_absolute(
+                order.event,
+                "presale:event.order",
+                kwargs={"order": order.code, "secret": order.secret},
+            ),
+            gettext("Order"),
+        )
+        location = str(ev.location or order.event.location or "").strip()
+        if location:
+            card.addBackField("venue", location, gettext("Venue"))
+
         if order_position.subevent:
             card.addBackField(
                 "website",
-                build_absolute_uri(
+                eventreverse_absolute(
                     order.event,
                     "presale:event.index",
-                    {"subevent": order_position.subevent.pk},
+                    kwargs={"subevent": order_position.subevent.pk},
                 ),
                 gettext("Website"),
             )
         else:
             card.addBackField(
                 "website",
-                build_absolute_uri(order.event, "presale:event.index"),
+                eventreverse_absolute(order.event, "presale:event.index"),
                 gettext("Website"),
             )
 
@@ -445,19 +561,15 @@ class PassbookOutput(BaseTicketOutput):
         except ItemMetaValue.DoesNotExist:
             pass
 
-        passfile = Pass(
+        passfile = PretixPass(
             card,
             passTypeIdentifier=order.event.settings.passbook_pass_type_id,
-            organizationName=str(ev.name),
+            organizationName=str(order.event.organizer.name),
             teamIdentifier=order.event.settings.passbook_team_id,
+            grouping_identifier=grouping_identifier(order_position),
         )
 
-        passfile.serialNumber = "%s-%s-%s-%d" % (
-            order.event.organizer.slug,
-            order.event.slug,
-            order.code,
-            order_position.pk,
-        )
+        passfile.serialNumber = serial_number(order_position)
 
         passfile.description = gettext("Ticket for {event} ({product})").format(
             event=ev.name, product=ticket
@@ -467,35 +579,33 @@ class PassbookOutput(BaseTicketOutput):
         )
         passfile.barcode.altText = order_position.secret
 
-        date_from_local_time = ev.date_from.astimezone(tz)
         date_to_local_time = ev.date_to.astimezone(tz) if ev.date_to else None
+        relevant_date = order_position.valid_from or ev.date_admission or ev.date_from
+        passfile.relevantDate = relevant_date.astimezone(tz).isoformat()
 
-        if (
-            order_position.valid_until
-            and order_position.valid_from
-            and order_position.valid_from.astimezone(tz).date()
-            != order_position.valid_until.astimezone(tz)
-        ):
+        expiration_date = None
+        if order_position.valid_until:
             # note: exprirationDate is a typo in the underlying wallet-library
-            passfile.exprirationDate = order_position.valid_until.astimezone(
-                tz
-            ).isoformat()
-        elif order_position.valid_from:
-            passfile.relevantDate = order_position.valid_from.astimezone(tz).isoformat()
-            if order_position.valid_until:
-                # note: exprirationDate is a typo in the underlying wallet-library
-                passfile.exprirationDate = order_position.valid_until.astimezone(
-                    tz
-                ).isoformat()
+            expiration_date = order_position.valid_until
         elif (
             order.event.settings.show_date_to
             and date_to_local_time
-            and date_to_local_time.date() != date_from_local_time.date()
+            and date_to_local_time > relevant_date.astimezone(tz)
         ):
+            expiration_date = ev.date_to
+
+        if expiration_date:
             # note: exprirationDate is a typo in the underlying wallet-library
-            passfile.exprirationDate = date_to_local_time.isoformat()
-        else:
-            passfile.relevantDate = date_from_local_time.isoformat()
+            passfile.exprirationDate = expiration_date.astimezone(tz).isoformat()
+
+        passfile.voided = bool(
+            order_position.canceled
+            or order_position.blocked
+            or order.status in (Order.STATUS_CANCELED, Order.STATUS_EXPIRED)
+            or (
+                expiration_date and expiration_date <= time_machine_now()
+            )
+        )
 
         if (
             self.event.settings.passbook_latitude
@@ -520,62 +630,53 @@ class PassbookOutput(BaseTicketOutput):
         elif self.event.geo_lat and self.event.geo_lon:
             passfile.locations = [Location(self.event.geo_lat, self.event.geo_lon)]
 
-        icon_file = self.event.settings.get("ticketoutput_passbook_icon")
+        icon_file = _setting_file(self.event, "ticketoutput_passbook_icon")
         if icon_file:
-            passfile.addFile("icon.png", default_storage.open(icon_file.name, "rb"))
+            _add_image(passfile, "icon.png", icon_file)
         else:
             passfile.addFile(
                 "icon.png", open(finders.find("pretix_passbook/icon.png"), "rb")
             )
 
         if logo_file:
-            passfile.addFile("logo.png", default_storage.open(logo_file.name, "rb"))
+            _add_image(passfile, "logo.png", logo_file)
         else:
             passfile.addFile(
                 "logo.png", open(finders.find("pretix_passbook/logo.png"), "rb")
             )
         passfile.logoText = logo_text
 
-        bg_file = self.event.settings.get("ticketoutput_passbook_background")
+        bg_file = _first_setting_file(
+            self.event,
+            ("ticketoutput_passbook_background", "og_image"),
+        )
         if bg_file:
-            passfile.addFile("background.png", default_storage.open(bg_file.name, "rb"))
+            _add_image(passfile, "background.png", bg_file)
 
         if self.event.settings.get("ticketoutput_passbook_selfscale"):
-            icon2x_file = self.event.settings.get("ticketoutput_passbook_icon2x")
+            icon2x_file = _setting_file(self.event, "ticketoutput_passbook_icon2x")
             if icon2x_file:
-                passfile.addFile(
-                    "icon@2x.png", default_storage.open(icon2x_file.name, "rb")
-                )
+                _add_image(passfile, "icon@2x.png", icon2x_file)
 
-            icon3x_file = self.event.settings.get("ticketoutput_passbook_icon3x")
+            icon3x_file = _setting_file(self.event, "ticketoutput_passbook_icon3x")
             if icon3x_file:
-                passfile.addFile(
-                    "icon@3x.png", default_storage.open(icon3x_file.name, "rb")
-                )
+                _add_image(passfile, "icon@3x.png", icon3x_file)
 
-            logo2x_file = self.event.settings.get("ticketoutput_passbook_logo2x")
+            logo2x_file = _setting_file(self.event, "ticketoutput_passbook_logo2x")
             if logo2x_file:
-                passfile.addFile(
-                    "logo@2x.png", default_storage.open(logo2x_file.name, "rb")
-                )
+                _add_image(passfile, "logo@2x.png", logo2x_file)
 
-            logo3x_file = self.event.settings.get("ticketoutput_passbook_logo3x")
+            logo3x_file = _setting_file(self.event, "ticketoutput_passbook_logo3x")
             if logo3x_file:
-                passfile.addFile(
-                    "logo@3x.png", default_storage.open(logo3x_file.name, "rb")
-                )
+                _add_image(passfile, "logo@3x.png", logo3x_file)
 
-            bg2x_file = self.event.settings.get("ticketoutput_passbook_background2x")
+            bg2x_file = _setting_file(self.event, "ticketoutput_passbook_background2x")
             if bg2x_file:
-                passfile.addFile(
-                    "background2x.png", default_storage.open(bg2x_file.name, "rb")
-                )
+                _add_image(passfile, "background@2x.png", bg2x_file)
 
-            bg3x_file = self.event.settings.get("ticketoutput_passbook_background3x")
+            bg3x_file = _setting_file(self.event, "ticketoutput_passbook_background3x")
             if bg3x_file:
-                passfile.addFile(
-                    "background@3x.png", default_storage.open(bg3x_file.name, "rb")
-                )
+                _add_image(passfile, "background@3x.png", bg3x_file)
         try:
             thumnailprop = order_position.item.meta_data.get("pretix_passbook_thumbnail")
 
@@ -597,7 +698,7 @@ class PassbookOutput(BaseTicketOutput):
         )
         return passfile
 
-    def generate(self, order_position: OrderPosition) -> Tuple[str, str, str]:
+    def generate_file(self, order_position: OrderPosition) -> Tuple[str, str, str]:
         order = order_position.order
         passfile = self.generate_pass(order_position)
         filename = "{}-{}.pkpass".format(order.event.slug, order.code)
@@ -632,3 +733,14 @@ class PassbookOutput(BaseTicketOutput):
 
         _pass.seek(0)
         return filename, "application/vnd.apple.pkpass", _pass.read()
+
+    def generate_order_file(self, order: Order, positions=None) -> Tuple[str, str, str]:
+        positions = positions or self.get_tickets_to_print(order)
+        content = BytesIO()
+        with ZipFile(content, "w") as zipfile:
+            for position in positions:
+                filename, _, data = self.generate_file(position)
+                zipfile.writestr(
+                    f"{order.code}-{position.positionid}{filename[filename.rfind('.'):]}", data
+                )
+        return f"{order.code}-passbook.pkpasses", "application/vnd.apple.pkpasses", content.getvalue()

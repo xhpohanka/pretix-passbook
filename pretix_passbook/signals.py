@@ -23,28 +23,28 @@ def register_global_settings(sender, **kwargs):
             (
                 "passbook_team_id",
                 forms.CharField(
-                    label=_("Passbook team ID"),
+                    label=_("Apple Team ID"),
                     required=False,
                 ),
             ),
             (
                 "passbook_pass_type_id",
                 forms.CharField(
-                    label=_("Passbook type"),
+                    label=_("Apple Pass Type ID"),
                     required=False,
                 ),
             ),
             (
                 "passbook_certificate_file",
                 CertificateFileField(
-                    label=_("Passbook certificate file"),
+                    label=_("Apple Pass Type ID certificate"),
                     required=False,
                 ),
             ),
             (
                 "passbook_wwdr_certificate_file",
                 CertificateFileField(
-                    label=_("Passbook CA Certificate"),
+                    label=_("Apple WWDR intermediate certificate"),
                     help_text=_(
                         "You can download the current CA certificate from apple at "
                         "https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer"
@@ -55,7 +55,7 @@ def register_global_settings(sender, **kwargs):
             (
                 "passbook_key",
                 forms.CharField(
-                    label=_("Passbook secret key"),
+                    label=_("Apple Pass Type ID private key"),
                     required=False,
                     widget=forms.Textarea,
                     validators=[validate_rsa_privkey],
